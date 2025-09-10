@@ -1,14 +1,23 @@
-from fastapi import FastAPI, HTTPException, status, Depends
+"""
+FastAPI application for insurance policy management and customer information system.
+"""
+
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from PolicyExpert.database import get_db, engine, Base, CustomerPolicies, InsuranceClaims, CustomerInfo
+import logging
 import os
+import uvicorn
 from dotenv import load_dotenv
 
+from database import get_db, engine, Base, CustomerPolicies, InsuranceClaims, CustomerInfo
+
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Pydantic Models ---
 from pydantic import BaseModel
@@ -79,6 +88,10 @@ class CustomerPolicyUpdateRequest(BaseModel):
     home_addons: Optional[str] = None
     travel_addons: Optional[str] = None
     life_addons: Optional[str] = None
+    
+    class Config:
+        # Ignore extra fields that are not in the model
+        extra = "ignore"
 
 class UpdateCustomerInfoRequest(BaseModel):
     customer_info: Optional[CustomerInfoUpdateRequest] = None
@@ -119,19 +132,17 @@ app = FastAPI(
     ]
 )
 
-# Add CORS middleware
+# Add CORS middleware with security considerations
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    max_age=3600,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"]
 )
 
 @app.get("/customerinfo/{customer_name}", 
          tags=["CustomerInfo"], 
-         operation_id="GetCustomerInfo",
          response_model=CustomerInfoResponse)
 async def get_customer_info(
     customer_name: str,
@@ -184,17 +195,17 @@ async def get_customer_info(
         rejected_claims = [c for c in claims if c.status == "REJECTED"]
         under_review_claims = [c for c in claims if c.status == "UNDER_REVIEW"]
         
-        # Calculate total claim amounts (remove ₹ and commas if present)
+        # Calculate total claim amounts (remove ₹, ?, and commas if present)
         total_approved_amount = 0
         total_rejected_amount = 0
         
         for claim in approved_claims:
-            amount_str = claim.amount.replace("₹", "").replace(",", "").strip()
+            amount_str = claim.amount.replace("₹", "").replace("?", "").replace(",", "").strip()
             if amount_str.isdigit():
                 total_approved_amount += int(amount_str)
         
         for claim in rejected_claims:
-            amount_str = claim.amount.replace("₹", "").replace(",", "").strip()
+            amount_str = claim.amount.replace("₹", "").replace("?", "").replace(",", "").strip()
             if amount_str.isdigit():
                 total_rejected_amount += int(amount_str)
         
@@ -204,8 +215,8 @@ async def get_customer_info(
             "rejected_claims": len(rejected_claims),
             "under_review_claims": len(under_review_claims),
             "approval_rate": round((len(approved_claims) / total_claims * 100), 2) if total_claims > 0 else 0,
-            "total_approved_amount": f"₹{total_approved_amount:,}",
-            "total_rejected_amount": f"₹{total_rejected_amount:,}",
+            "total_approved_amount": f"{total_approved_amount:,}",
+            "total_rejected_amount": f"{total_rejected_amount:,}",
             "last_claim_date": claims[0].date_submitted.isoformat() if claims else None
         }
         
@@ -245,8 +256,7 @@ async def get_customer_info(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/customerinfo", 
-         tags=["CustomerInfo"], 
-         operation_id="SearchCustomers")
+         tags=["CustomerInfo"])
 async def search_customers(
     name: Optional[str] = None,
     db: Session = Depends(get_db)
@@ -311,8 +321,7 @@ async def search_customers(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/",
-         tags=["root"],
-         operation_id="GetRoot")
+         tags=["root"])
 def read_root():
     """
     Welcome endpoint for the Policy Expert API.
@@ -327,25 +336,20 @@ def read_root():
         "endpoints": {
             "customer_info": "/customerinfo/{customer_name}",
             "search_customers": "/customerinfo?name={optional_name}",
+            "update_customer": "/updatecustomerinfo",
+            "simple_customer": "/customerinfo/simple/{customer_name}",
             "health_check": "/health",
             "api_docs": "/docs"
         }
     }
 
 @app.get("/health",
-         tags=["health"],
-         operation_id="HealthCheck")
+         tags=["health"])
 async def health_check(
     db: Session = Depends(get_db)
 ):
     """
     Health check endpoint that verifies database connectivity.
-    
-    Parameters:
-    - db: Database session dependency
-    
-    Returns:
-    - Dict: Health status with database connectivity information
     """
     try:
         # Test database connection
@@ -370,6 +374,7 @@ async def health_check(
             }
         }
     except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
         return {
             "status": "unhealthy",
             "timestamp": datetime.now().isoformat(),
@@ -382,8 +387,7 @@ async def health_check(
         }
 
 @app.post("/updatecustomerinfo",
-          tags=["CustomerInfo"],
-          operation_id="UpdateCustomerInfo")
+          tags=["CustomerInfo"])
 async def update_customer_info(
     update_request: UpdateCustomerInfoRequest,
     db: Session = Depends(get_db)
@@ -414,14 +418,16 @@ async def update_customer_info(
             if customer_info:
                 # Update existing record
                 if customer_info_data.final_premium_amount is not None:
-                    customer_info.final_premium_amount = customer_info_data.final_premium_amount
-                if customer_info_data.addons_with_amount is not None:
-                    customer_info.addons_with_amount = customer_info_data.addons_with_amount
+                    # Store the amount as-is without any currency prefix
+                    customer_info.final_premium_amount = customer_info_data.final_premium_amount.strip()
+                
+                # Always update addons_with_amount even if it's None/null (to clear the field)
+                customer_info.addons_with_amount = customer_info_data.addons_with_amount
             else:
                 # Create new record
                 customer_info = CustomerInfo(
                     customer_name=customer_info_data.customer_name,
-                    final_premium_amount=customer_info_data.final_premium_amount,
+                    final_premium_amount=customer_info_data.final_premium_amount.strip() if customer_info_data.final_premium_amount else None,
                     addons_with_amount=customer_info_data.addons_with_amount
                 )
                 db.add(customer_info)
@@ -525,7 +531,6 @@ async def update_customer_info(
 
 @app.get("/customerinfo/simple/{customer_name}",
          tags=["CustomerInfo"],
-         operation_id="GetSimpleCustomerInfo",
          response_model=SimpleCustomerInfoResponse)
 async def get_simple_customer_info(
     customer_name: str,
@@ -563,3 +568,11 @@ async def get_simple_customer_info(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        reload=os.getenv("ENV", "dev") == "dev"
+    )
